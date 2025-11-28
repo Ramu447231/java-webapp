@@ -1,0 +1,394 @@
+<content>
+# Full CI/CD Microservices Project (Jenkins + Kubernetes)
+A simple, complete monorepo layout for 3 Node.js microservices with Dockerfiles, Kubernetes manifests, a Jenkins pipeline (single multibranch / monorepo pipeline), local docker-compose, and helpful scripts.
+
+---
+
+## Repo layout
+
+```
+microservices-ci-cd/
+├── README.md
+├── docker-compose.yml
+├── jenkins/
+│   └── credentials-example.env
+├── k8s/
+│   ├── base/
+│   │   ├── namespace.yaml
+│   │   └── common-ingress.yaml        # optional
+│   └── overlays/
+│       ├── dev/
+│       │   ├── auth-deployment.yaml
+│       │   ├── user-deployment.yaml
+│       │   ├── payment-deployment.yaml
+│       │   └── ingress.yaml
+│       └── prod/ (copy dev and adjust)
+├── services/
+│   ├── auth-service/
+│   │   ├── package.json
+│   │   ├── server.js
+│   │   ├── Dockerfile
+│   │   └── k8s-deployment.yaml (optional duplicate)
+│   ├── user-service/
+│   │   └── ...
+│   └── payment-service/
+│       └── ...
+└── Jenkinsfile         # root pipeline for all services
+```
+
+---
+
+## 1) README.md (root)
+
+````markdown
+# Microservices CI/CD Example (Jenkins + Kubernetes)
+
+Three simple Node.js microservices:
+- auth-service
+- user-service
+- payment-service
+
+CI: Jenkins (Jenkinsfile included)
+Container registry: Docker Hub or AWS ECR (set env vars)
+Kubernetes: any cluster (minikube, kind, EKS)
+
+## Quickstart (local)
+1. Build and run locally:
+   ```bash
+   docker-compose up --build
+````
+
+2. Visit:
+
+   * [http://localhost:3001/auth/health](http://localhost:3001/auth/health)
+   * [http://localhost:3002/user/health](http://localhost:3002/user/health)
+   * [http://localhost:3003/payment/health](http://localhost:3003/payment/health)
+
+## Jenkins setup (high level)
+
+* Install Jenkins with Docker & kubectl access.
+* Add credentials (DOCKER_REGISTRY, DOCKER_USERNAME, DOCKER_PASSWORD, KUBECONFIG content or mount).
+* Create a Multibranch Pipeline pointing to this repo (or a Pipeline job if single branch).
+* Pipeline reads `Jenkinsfile` at repo root.
+
+## Deployment
+
+Jenkins builds images, tags them with build number or Git SHA, pushes to registry, updates k8s manifest (IMAGE_TAG) and runs `kubectl apply`.
+
+See `Jenkinsfile` for exact pipeline steps.
+
+````
+
+---
+
+## 2) Example service (auth-service)
+`services/auth-service/package.json`
+```json
+{
+  "name": "auth-service",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"no tests\""
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
+````
+
+`services/auth-service/server.js`
+
+```js
+const express = require('express');
+const app = express();
+const port = process.env.PORT || 8080;
+
+app.get('/auth/health', (req, res) => res.json({status: 'ok', service: 'auth'}));
+app.get('/auth', (req, res) => res.json({message: 'auth-service'}));
+
+app.listen(port, () => console.log(`auth-service listening on ${port}`));
+```
+
+`services/auth-service/Dockerfile`
+
+```Dockerfile
+FROM node:18-alpine
+WORKDIR /app
+COPY package.json ./
+RUN npm install --production
+COPY . .
+ENV PORT=8080
+EXPOSE 8080
+CMD ["npm","start"]
+```
+
+Duplicate this structure for `user-service` (routes `/user/health`, port 8081) and `payment-service` (routes `/payment/health`, port 8082). Update ports in Dockerfiles and server.js accordingly.
+
+---
+
+## 3) docker-compose.yml (local testing)
+
+```yaml
+version: '3.8'
+services:
+  auth:
+    build: ./services/auth-service
+    ports:
+      - "3001:8080"
+  user:
+    build: ./services/user-service
+    ports:
+      - "3002:8080"
+  payment:
+    build: ./services/payment-service
+    ports:
+      - "3003:8080"
+```
+
+---
+
+## 4) Kubernetes manifests (k8s/overlays/dev/*.yaml)
+
+Below is a single example (auth). The other two services mirror this with image & port changes.
+
+`k8s/overlays/dev/auth-deployment.yaml`
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: microservices-dev
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: microservices-dev
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+    spec:
+      containers:
+      - name: auth-service
+        image: <REGISTRY>/auth-service:IMAGE_TAG
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /auth/health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /auth/health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: microservices-dev
+spec:
+  selector:
+    app: auth-service
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+```
+
+Create similar `user-deployment.yaml` and `payment-deployment.yaml` replacing names, image names, and ports.
+
+An optional `ingress.yaml` can route `/auth`, `/user`, `/payment` paths to services.
+
+---
+
+## 5) Jenkins pipeline (root `Jenkinsfile`)
+
+This Jenkinsfile builds all services in parallel and deploys to k8s. It uses environment variables for registry, credentials, and kubeconfig.
+
+```groovy
+pipeline {
+  agent any
+
+  environment {
+    REGISTRY = credentials('DOCKER_REGISTRY_URL') // or plain text var
+    DOCKER_USER = credentials('DOCKER_USERNAME')
+    DOCKER_PASS = credentials('DOCKER_PASSWORD')
+    KUBECONFIG_CREDENTIALS = credentials('KUBECONFIG_BASE64') // base64 encoded kubeconfig
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Build & Push Images') {
+      parallel {
+        stage('Build auth') {
+          steps {
+            dir('services/auth-service') {
+              sh 'docker build -t $REGISTRY/auth-service:${GIT_COMMIT}-${BUILD_NUMBER} .'
+              sh 'echo $DOCKER_PASS | docker login $REGISTRY -u $DOCKER_USER --password-stdin'
+              sh 'docker push $REGISTRY/auth-service:${GIT_COMMIT}-${BUILD_NUMBER}'
+            }
+          }
+        }
+
+        stage('Build user') {
+          steps {
+            dir('services/user-service') {
+              sh 'docker build -t $REGISTRY/user-service:${GIT_COMMIT}-${BUILD_NUMBER} .'
+              sh 'echo $DOCKER_PASS | docker login $REGISTRY -u $DOCKER_USER --password-stdin'
+              sh 'docker push $REGISTRY/user-service:${GIT_COMMIT}-${BUILD_NUMBER}'
+            }
+          }
+        }
+
+        stage('Build payment') {
+          steps {
+            dir('services/payment-service') {
+              sh 'docker build -t $REGISTRY/payment-service:${GIT_COMMIT}-${BUILD_NUMBER} .'
+              sh 'echo $DOCKER_PASS | docker login $REGISTRY -u $DOCKER_USER --password-stdin'
+              sh 'docker push $REGISTRY/payment-service:${GIT_COMMIT}-${BUILD_NUMBER}'
+            }
+          }
+        }
+      } // parallel
+    }
+
+    stage('Deploy to Kubernetes') {
+      steps {
+        // restore kubeconfig file from base64 credential
+        sh '''
+          echo "$KUBECONFIG_CREDENTIALS" | base64 -d > kubeconfig
+          export KUBECONFIG=$PWD/kubeconfig
+        '''
+
+        // Replace IMAGE_TAG placeholder in k8s manifests and apply
+        sh '''
+          IMAGE_TAG=${GIT_COMMIT}-${BUILD_NUMBER}
+          REG=${REGISTRY}
+          for svc in auth user payment; do
+            sed "s|<REGISTRY>|${REG}|g; s|IMAGE_TAG|${IMAGE_TAG}|g" k8s/overlays/dev/${svc}-deployment.yaml > /tmp/${svc}-deploy.yaml
+            kubectl apply -f /tmp/${svc}-deploy.yaml
+          done
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline finished"
+    }
+  }
+}
+```
+
+**Notes:**
+
+* Add Jenkins credentials of kind "Secret text" for DOCKER_USERNAME, DOCKER_PASSWORD and DOCKER_REGISTRY_URL, and base64-encoded kubeconfig (KUBECONFIG_BASE64).
+* Instead of base64 kubeconfig you can mount a kubeconfig file into Jenkins or use the Kubernetes plugin and a service account.
+
+---
+
+## 6) jenkins/credentials-example.env
+
+```
+DOCKER_REGISTRY_URL=index.docker.io/yourdockerhubuser
+DOCKER_USERNAME=yourdockerhubuser
+DOCKER_PASSWORD=yourpassword
+KUBECONFIG_BASE64=$(cat ~/.kube/config | base64 -w0)
+```
+
+(Do not commit real secrets; add these to Jenkins credentials.)
+
+---
+
+## 7) Optional: Helm Chart skeleton (quick)
+
+Create `charts/microservices/Chart.yaml` and templates per service if you want templated deploys. Helm is recommended for production.
+
+`charts/microservices/templates/deployment.yaml` (simple excerpt)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "microservices.fullname" . }}-{{ .Values.name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  template:
+    spec:
+      containers:
+      - name: {{ .Values.name }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        ports:
+        - containerPort: {{ .Values.containerPort }}
+```
+
+---
+
+## 8) Tips & extra files
+
+* Add `.dockerignore` to each service:
+
+```
+node_modules
+npm-debug.log
+.DS_Store
+.git
+```
+
+* Add simple health checks & readiness/liveness (already in k8s manifests).
+* For ECR: replace registry and login steps with `aws ecr get-login-password | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com`.
+
+---
+
+## 9) How to run (Dev)
+
+1. Start local cluster (minikube or kind).
+2. Build images and push to a registry accessible by cluster (minikube has its own docker daemon option).
+3. Ensure Jenkins has Docker & kubectl and credentials.
+4. Create Jenkins Multibranch Pipeline pointing to this repo.
+5. Push to repo; Jenkins triggers and deploys.
+
+---
+
+## 10) Troubleshooting & next steps
+
+* If `kubectl` in Jenkins can't access cluster: either mount kubeconfig into Jenkins or use a build agent pod inside the cluster (Jenkins Kubernetes plugin).
+* For secure deployments: use imagePullSecrets and Kubernetes service accounts.
+* Add automated tests and security scanning (Snyk, Trivy) as pre-push steps.
+* Add canary/blue-green using Helm or service mesh (Istio/Linkerd) for traffic splitting.
+
+---
+
+## 11) Example minimal .gitignore
+
+```
+node_modules/
+kubeconfig
+.kube/
+.env
+.DS_Store
+```
+
+---
+
+That's the full scaffold — copy the files into your repo or tell me which pieces you'd like generated as files (I can paste exact contents for user-service and payment-service too). </content>
